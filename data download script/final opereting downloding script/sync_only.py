@@ -1,0 +1,612 @@
+from __future__ import (division, print_function, absolute_import, unicode_literals)
+
+import gc
+import csv
+import geopandas as gpd
+import shapely
+import sys
+
+from satpy import Scene
+from glob import glob
+
+import sys
+
+import os.path
+
+import json
+
+from goes2go.data import goes_nearesttime
+import rioxarray
+
+import numpy as np
+import re
+import xarray as xr
+import warnings
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
+
+
+
+
+from io import StringIO
+USERAGENT = 'tis/download.py_1.0--' + sys.version.replace('\n','').replace('\r','')
+from datetime import datetime, timedelta
+
+def combine_viirs_images(input_dir, output_dir, AOI):
+    """
+    Combine two VIIRS images using Satpy, slice them, clip to AOI, and save the final clipped version.
+
+    Parameters:
+        input_dir (str): Directory containing VIIRS image files.
+        output_dir (str): Directory where the final clipped image will be saved.
+        AOI (GeoDataFrame): Area of Interest (AOI) polygon for clipping.
+
+    Returns:
+        None
+    """
+    # Ensure output directory exists
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Locate VIIRS files
+    viirs_files = glob(os.path.join(input_dir, "*.nc"))
+    if len(viirs_files) < 2:
+        raise ValueError("At least two VIIRS files are required for combining.")
+
+    # Load files into a Satpy Scene
+    scene = Scene(reader="viirs_l1b", filenames=viirs_files[:2])
+
+    # Load all available datasets
+    scene.load(scene.available_dataset_names())
+    # print(scene.available_dataset_names())
+
+    # Resample to target area
+    target_area = "goes_east_abi_c_500m"
+    combined_scene = scene.resample(target_area, resampler="nearest")
+
+    # Extract band data and combine them
+    my_bands = ["I04", "I05"]
+    band_data_list = [combined_scene[band].values for band in my_bands]
+    combined_bands = np.stack(band_data_list, axis=0)
+
+    # Wrap the combined data into an xarray DataArray with rioxarray extension
+    combined_data_rio = xr.DataArray(
+        combined_bands,
+        dims=["band", "y", "x"],
+        coords={
+            "band": [1, 2],  # Band indices
+            "y": combined_scene["I04"].y,
+            "x": combined_scene["I04"].x
+        },
+        attrs=combined_scene["I04"].attrs,  # Copy CRS and attributes
+    )
+    combined_data_rio.rio.write_crs(combined_scene["I04"].attrs["area"].crs.to_string(), inplace=True)
+
+    # ✅ Clip the image using AOI
+    AOI_reprojected = AOI.to_crs(combined_data_rio.rio.crs)
+    clipped_img = combined_data_rio.rio.clip(AOI_reprojected.geometry)
+
+    # ✅ Save only the final clipped version
+    output_tif = os.path.join(output_dir, "combined_clip.tif")
+    clipped_img.rio.to_raster(output_tif)
+
+    print(f"✅ Final clipped VIIRS image saved at {output_tif}")
+
+
+
+
+
+# this is the choice of last resort, when other attempts have failed
+def getcURL(url, headers=None, out=None):
+    # OS X Python 2 and 3 don't support tlsv1.1+ therefore... cURL
+    import subprocess
+    try:
+        print('trying cURL', file=sys.stderr)
+        args = ['curl', '--fail', '-sS', '-L', '-b session', '--get', url]
+        for (k, v) in headers.items():
+            args.extend(['-H', ': '.join([k, v])])
+        if out is None:
+            # python3's subprocess.check_output returns stdout as a byte string
+            result = subprocess.check_output(args)
+            return result.decode('utf-8') if isinstance(result, bytes) else result
+        else:
+            subprocess.call(args, stdout=out)
+    except subprocess.CalledProcessError as e:
+        print('curl GET error message: %' + (e.message if hasattr(e, 'message') else e.output), file=sys.stderr)
+    return None
+
+
+# read the specified URL and output to a file
+def geturl(url, token=None, out=None):
+    headers = {'user-agent': USERAGENT}
+    if not token is None:
+        headers['Authorization'] = 'Bearer ' + token
+    try:
+        import ssl
+        CTX = ssl.SSLContext(ssl.PROTOCOL_TLSv1_2)
+        if sys.version_info.major == 2:
+            import urllib2
+            try:
+                fh = urllib2.urlopen(urllib2.Request(url, headers=headers), context=CTX)
+                if out is None:
+                    return fh.read()
+                else:
+                    shutil.copyfileobj(fh, out)
+            except urllib2.HTTPError as e:
+                print('TLSv1_2 sys 2 : HTTP GET error code: %d' % e.code, file=sys.stderr)
+                return getcURL(url, headers, out)
+            except urllib2.URLError as e:
+                print('TLSv1_2 sys 2 : Failed to make request: %s, RETRYING' % e.reason, file=sys.stderr)
+                return getcURL(url, headers, out)
+            return None
+
+        else:
+            from urllib.request import urlopen, Request, URLError, HTTPError
+            try:
+                fh = urlopen(Request(url, headers=headers), context=CTX)
+                if out is None:
+                    return fh.read().decode('utf-8')
+                else:
+                    shutil.copyfileobj(fh, out)
+            except HTTPError as e:
+                print('TLSv1_2 : HTTP GET error code: %d' % e.code, file=sys.stderr)
+                return getcURL(url, headers, out)
+            except URLError as e:
+                print('TLSv1_2 : Failed to make request: %s' % e.reason, file=sys.stderr)
+                return getcURL(url, headers, out)
+            return None
+
+    except AttributeError:
+        return getcURL(url, headers, out)
+
+
+################################################################################
+
+
+DESC = "This script will recursively download all files if they don't exist from a LAADS URL and will store them to the specified path"
+
+
+def sync(src, dest, tok):
+    '''Synchronize src URL with dest directory (downloads files).'''
+    try:
+        import csv
+        files = {}
+        files['content'] = [f for f in csv.DictReader(StringIO(geturl('%s.csv' % src, tok)), skipinitialspace=True)]
+    except ImportError:
+        files = json.loads(geturl(src + '.json', tok))
+
+    # Use os.path since python 2/3 both support it while pathlib is 3.4+
+    for f in files['content']:
+        print(f)  # Debugging: Print the content of 'f' to understand its structure
+
+        # Safely access 'name' and 'size'
+        name = f.get('name', 'default_name')  # Default to 'default_name' if 'name' is missing
+        filesize = int(f.get('size', 0))  # Default to 0 if 'size' is missing
+        path = os.path.join(dest, name)
+        url = src + '/' + name
+
+        if filesize == 0:  # size FROM RESPONSE
+            try:
+                print('creating dir:', path)
+                os.makedirs(path, exist_ok=True)  # ✅ Use `makedirs` instead of `mkdir` to avoid errors
+                sync(src + '/' + name, path, tok)  # ✅ Recursively sync subdirectories
+            except Exception as e:  # ✅ Catch all exceptions but don't stop
+                print(f"⚠ Warning: Failed to create directory `{path}`: {e}", file=sys.stderr)
+                continue  # ✅ Skip to the next file instead of stopping
+
+        else:
+            try:
+                if not os.path.exists(path) or os.path.getsize(path) == 0:  # filesize FROM OS
+                    print('\n📥 Downloading:', path)
+                    with open(path, 'w+b') as fh:
+                        geturl(url, tok, fh)
+                else:
+                    print('✅ Skipping (already exists):', path)
+            except Exception as e:
+                print(f"❌ Error: Failed to download `{name}`: {e}", file=sys.stderr)
+                continue  # ✅ Skip to the next file instead of stopping
+
+    print("✅ Sync completed!")  # ✅ Indicate that sync finished
+    return 0
+
+
+
+
+from datetime import datetime, timedelta
+
+base_url = "https://example.com"  # Replace with your actual base URL
+def generate_file_paths(start_date, end_date):
+    """Generate file paths for each date in the given range"""
+    file_paths = []
+    current_date = start_date
+    while current_date <= end_date:
+        year = current_date.strftime('%Y')
+        day_of_year = current_date.strftime('%j')  # Day of the year
+        filename = f"VNP02IMG.A{year}{day_of_year}.0000.002.{year}{day_of_year}100726.nc"
+        url = f"{base_url}/{year}/{day_of_year}/{filename}"
+        file_paths.append((url, filename))
+        current_date += timedelta(days=1)
+    return file_paths
+
+
+from datetime import datetime, timedelta
+
+base_url = "https://example.com"  # Replace with your actual base URL
+def generate_file_paths(start_date, end_date):
+    """Generate file paths for each date in the given range"""
+    file_paths = []
+    current_date = start_date
+    while current_date <= end_date:
+        year = current_date.strftime('%Y')
+        day_of_year = current_date.strftime('%j')  # Day of the year
+        filename = f"VNP02IMG.A{year}{day_of_year}.1048.002.{year}{day_of_year}184920.nc"
+        url = f"{base_url}/{year}/{day_of_year}/{filename}"
+        file_paths.append((url, filename))
+        current_date += timedelta(days=1)
+    return file_paths
+
+
+# def extract_datetime_from_filename(filename):
+#     """Extract the date and time from the filename."""
+#     try:
+#         # Remove the prefix (e.g., "VNP02IMG.") and split by the first dot to get the date part
+#         parts = filename.split('.')
+#         if len(parts) < 4:
+#             raise ValueError(f"Invalid filename format: {filename}")
+#
+#         # Extract the date part encoded as AYYYYDDD (e.g., A2022335 for December 1, 2022)
+#         date_part = parts[1][1:]  # Remove 'A' prefix from 'AYYYYDDD'
+#         year = int(date_part[:4])
+#         day_of_year = int(date_part[4:])
+#         extracted_date = datetime(year, 1, 1) + timedelta(days=day_of_year - 1)
+#
+#         # Extract the time part from the filename (e.g., 1048 in VNP02IMG.AYYYYDDD.1048.002...)
+#         time_part = parts[2]
+#         hours = int(time_part[:2])
+#         minutes = int(time_part[2:])
+#         extracted_datetime = extracted_date.replace(hour=hours, minute=minutes)
+#
+#         return extracted_datetime
+#     except Exception as e:
+#         print(f"Error extracting date and time from filename '{filename}': {e}")
+#         return None
+
+def extract_datetime_from_filename(filepath):
+    """Extract the date and time from the file path by working from the end."""
+    try:
+        # Extract the filename from the path
+        filename = os.path.basename(filepath)
+
+        # Split the filename by dots
+        parts = filename.split('.')
+
+        # Find the part that starts with 'A' and has the correct length
+        for part in reversed(parts):
+            if part.startswith('A') and len(part) >= 8:
+                date_part = part[1:]  # Remove 'A' prefix
+                break
+        else:
+            raise ValueError(f"No valid date part found in filename: {filename}")
+
+        # Find the first part that looks like a time (HHMM format)
+        for part in reversed(parts):
+            if len(part) == 4 and part.isdigit():
+                time_part = part
+                break
+        else:
+            raise ValueError(f"No valid time part found in filename: {filename}")
+
+        # Extract year and day of year
+        year = int(date_part[:4])
+        day_of_year = int(date_part[4:])
+        extracted_date = datetime(year, 1, 1) + timedelta(days=day_of_year - 1)
+
+        # Extract hours and minutes
+        hours = int(time_part[:2])
+        minutes = int(time_part[2:])
+        extracted_datetime = extracted_date.replace(hour=hours, minute=minutes)
+
+        return extracted_datetime
+    except Exception as e:
+        print(f"Error extracting date and time from filepath '{filepath}': {e}")
+        return None
+
+
+def download_goes_data(start_time,out_dir,satellite):
+    # Specify the satellite and product
+    product = "ABI-L2-MCMIPC"  # Use the specified product
+    os.makedirs(out_dir, exist_ok=True)  # Create the directory if it doesn't exist
+
+    # Download data for the nearest observation at the current time
+    try:
+        print(f"Attempting to find data nearest to: {start_time}...")
+        g = goes_nearesttime(
+            attime=start_time.strftime("%Y-%m-%d %H:%M"),  # Format the time as a string
+            satellite=satellite,
+            product=product,
+            return_as="filelist",
+            download=True,  # Set to True to download the file immediately
+            save_dir=out_dir,  # Specify the output directory
+            overwrite=False  # Set to False to avoid overwriting existing files
+        )
+
+        # Print the structure of g to understand its contents
+        print(f"Downloaded data structure: {g}")
+
+        # Collect the downloaded file paths
+        for index, row in g.iterrows():  # Iterate over DataFrame rows
+            print(f"Downloaded file: {row['file']}")  # Print each downloaded file
+
+    except Exception as e:
+        print(f"An error occurred while finding data: {e}")
+
+
+import os
+import shutil
+
+def move_files_to_parent(root_dir, dest):
+    """
+    Recursively navigates through subdirectories of root_dir to find files
+    and moves them to the destination directory (dest).
+    """
+    for item_name in os.listdir(root_dir):
+        item_path = os.path.join(root_dir, item_name)
+
+        # If item_path is a directory, navigate into it
+        if os.path.isdir(item_path):
+            move_files_to_parent(item_path, dest)  # Recursively process subdirectories
+
+        # If item_path is a file, move it to the destination directory
+        elif os.path.isfile(item_path):
+            try:
+                # Check if the file already exists in the destination directory
+                dest_file = os.path.join(dest, os.path.basename(item_path))
+                if os.path.exists(dest_file):
+                    # Generate a unique name for the file
+                    base, ext = os.path.splitext(os.path.basename(item_path))
+                    counter = 1
+                    while os.path.exists(dest_file):
+                        dest_file = os.path.join(dest, f"{base}_{counter}{ext}")
+                        counter += 1
+
+                shutil.move(item_path, dest_file)  # Move the file to the destination
+                print(f"Moved {item_path} to {dest_file}")
+            except Exception as e:
+                print(f"Failed to move {item_path} to {dest}: {e}")
+
+    # After processing, remove the empty directory
+    if root_dir != dest:  # Prevent deleting the destination directory
+        try:
+            os.rmdir(root_dir)  # Only removes the folder if it's empty
+            # print(f"Removed empty folder: {root_dir}")
+        except OSError:
+            pass  # Skip if the folder is not empty or can't be removed
+
+def show_tif_value_range(tif_path):
+    """
+    Display the range of values in a GeoTIFF file.
+
+    Parameters:
+        tif_path (str): Path to the GeoTIFF file.
+
+    Returns:
+        None
+    """
+    try:
+        # Open the GeoTIFF file
+        tif_data = rioxarray.open_rasterio(tif_path)
+
+        # Convert to numpy array and compute min and max
+        values = tif_data.values
+        min_value = np.nanmin(values)  # Use nanmin to ignore NaN values
+        max_value = np.nanmax(values)  # Use nanmax to ignore NaN values
+
+        print(f"Value range for {tif_path}:")
+        print(f"Minimum value: {min_value}")
+        print(f"Maximum value: {max_value}")
+    except Exception as e:
+        print(f"Error processing the GeoTIFF file: {e}")
+
+
+def get_VIIRS_bounds_polygon(VIIRS_fire_path):
+    """
+    Get a VIIRS fire product path return a polygon of VIIRS image bounds
+
+    :VIIRS_fire_path: VIIRS fire product for example "C:\\Asaf\\VIIRS\\VNP14IMG.A2020251.2042.001.2020258064138"
+
+    :return: geodataframe of bounds in lat/lon WGS84 projection
+    """
+    VIIRS = xr.open_dataset(VIIRS_fire_path)  ## Open file
+    ## Now for the bbox bounds
+    lat_bounds = VIIRS.attrs['GRingPointLatitude']
+    lon_bounds = VIIRS.attrs['GRingPointLongitude']
+
+    pol_bounds = []  ## Empty bounds list
+    for i in range(len(lat_bounds)):  ## for all bounds
+        coord = (lon_bounds[i], lat_bounds[i])  ## Take lon/lat
+        pol_bounds.append(coord)  ## append
+    pol_bounds.append((lon_bounds[0], lat_bounds[0]))  ## append firt coords to "close" the polygon
+
+    pol = shapely.Polygon(pol_bounds)  ## Create polygon
+    gdf_pol = gpd.GeoDataFrame({'geometry': [pol]}, crs=4326)  ## Create as gdf
+
+    return (gdf_pol)
+
+
+
+def log_invalid_order(order_folder: str, error_msg: str):
+    """
+    Append a row to W:\\Sat_Project\\log.csv indicating the order folder that failed
+    and the exception message describing the failure reason.
+    """
+    log_csv = r"W:\Sat_Project\log.csv"
+    # Open CSV in append mode so each run adds new lines
+    with open(log_csv, "a", newline="") as f:
+        writer = csv.writer(f)
+        # Columns: [current system time, order folder, error message]
+        writer.writerow([datetime.now().strftime("%Y-%m-%d %H:%M:%S"), order_folder, error_msg])
+
+
+import os
+import shutil
+import re
+import gc
+import rioxarray
+import geopandas as gpd
+from glob import glob
+from datetime import datetime
+
+
+# -------------------------------------------------------------------------
+# 1. Helper function to parse folder names like "2024-11-01_14-30"
+#    and convert to a datetime object.
+# -------------------------------------------------------------------------
+def parse_folder_datetime(folder_name):
+    """
+    Expects folder_name in format: YYYY-MM-DD_HH-MM
+    Returns a datetime object or None if parsing fails.
+    """
+    try:
+        return datetime.strptime(folder_name, "%Y-%m-%d_%H-%M")
+    except ValueError:
+        return None
+
+
+
+
+import os
+import shutil
+
+# If you have a function like this in your code, reuse it.
+# Otherwise, implement it or replace with a simple `pass`.
+def log_invalid_order(order_folder, reason):
+    """
+    Example stub to show how you'd log invalid orders.
+    Adjust to match your actual logging mechanism if needed.
+    """
+    log_path = r"W:\Sat_Project\log.csv"
+    with open(log_path, 'a', encoding='utf-8') as f:
+        # Write 'order_folder,reason' or your preferred format
+        f.write(f"{order_folder},{reason}\n")
+
+
+# if __name__ == "__main__":
+#     downloads_dir = r"W:\Sat_Project\DOWNLOADS"  # Same as in your main script
+#     processed_dir = r"W:\Sat_Project\Processed"  # Same as in your main script
+#
+#     valid_dir = os.path.join(processed_dir, "VALID")
+#     invalid_dir = os.path.join(processed_dir, "INVALID")
+#
+#     # Ensure these directories exist
+#     os.makedirs(valid_dir, exist_ok=True)
+#     os.makedirs(invalid_dir, exist_ok=True)
+#
+#     print("✅ Starting classification-only script for leftover folders...")
+#
+#     # Go through everything in DOWNLOADS
+#     for order_folder in os.listdir(downloads_dir):
+#         order_path = os.path.join(downloads_dir, order_folder)
+#         # Skip if not a directory
+#         if not os.path.isdir(order_path):
+#             continue
+#
+#         # --------------------- CHECK FINAL FILES ---------------------
+#         combined_ok = os.path.exists(os.path.join(order_path, "combined_clip.tif"))
+#
+#         # Must have at least two out of clipped_geo16, clipped_geo17, clipped_geo18
+#         possible_goes = ["clipped_geo16.tif", "clipped_geo17.tif", "clipped_geo18.tif"]
+#         goes_found = sum(os.path.exists(os.path.join(order_path, gf)) for gf in possible_goes)
+#
+#         # Build year_month subfolder based on folder name if it starts like YYYY-MM-DD
+#         # We'll try safely splitting:
+#         # e.g., "2024-11-01_12-00" -> "2024-11"
+#         try:
+#             year_month = order_folder.split('_')[0][:7]  # "2024-11"
+#         except IndexError:
+#             year_month = "UNKNOWN"
+#
+#         valid_subdir = os.path.join(valid_dir, year_month)
+#         invalid_subdir = os.path.join(invalid_dir, year_month)
+#         os.makedirs(valid_subdir, exist_ok=True)
+#         os.makedirs(invalid_subdir, exist_ok=True)
+#
+#         # --------------------- VALID vs. INVALID ---------------------
+#         if combined_ok and goes_found >= 2:
+#             target_dir = valid_subdir
+#             status = "VALID"
+#         else:
+#             target_dir = invalid_subdir
+#             status = "INVALID"
+#             # Log reason
+#             log_invalid_order(order_folder, "Missing final required files (combined_clip or enough GOES images)")
+#
+#         # --------------------- MOVE FOLDER ---------------------
+#         dest_path = os.path.join(target_dir, order_folder)
+#         if os.path.exists(dest_path):
+#             print(f"✅ Folder '{order_folder}' already in {status}, skipping.")
+#         else:
+#             try:
+#                 shutil.move(order_path, dest_path)
+#                 print(f"✅ Moved '{order_folder}' -> {status}")
+#             except Exception as e:
+#                 print(f"❌ Error moving '{order_folder}' to {target_dir}: {e}")
+#
+#     print("✅ Classification-only run complete. All leftover folders should be moved.")
+
+
+
+
+
+if __name__ == '__main__':
+    # Validate arguments
+    if len(sys.argv) != 3:
+        print("Usage: python your_script.py <order_number> <folder_number>")
+        sys.exit(1)
+
+    ordernumber = sys.argv[1]  # first argument
+    num = sys.argv[2]  # second argument (folder number)
+
+
+    source = f"https://ladsweb.modaps.eosdis.nasa.gov/archive/orders/{ordernumber}/"
+    token = "eyJ0eXAiOiJKV1QiLCJvcmlnaW4iOiJFYXJ0aGRhdGEgTG9naW4iLCJzaWciOiJlZGxqd3RwdWJrZXlfb3BzIiwiYWxnIjoiUlMyNTYifQ.eyJ0eXBlIjoiVXNlciIsInVpZCI6ImxpZWxsYSIsImV4cCI6MTc0Njk2MTgwMSwiaWF0IjoxNzQxNzc3ODAxLCJpc3MiOiJodHRwczovL3Vycy5lYXJ0aGRhdGEubmFzYS5nb3YiLCJpZGVudGl0eV9wcm92aWRlciI6ImVkbF9vcHMiLCJhY3IiOiJlZGwiLCJhc3N1cmFuY2VfbGV2ZWwiOjN9.jzNH5NvNgY_tKCqtNz1iv_xpHc92rWAaoLMY4e0pWnhgpdHCzcpALlgmJt2RF3JnffAYHJdMf0ty55Ny-KymEVZ5txKabychqI0PpC3sehl2oWVKH1rMTQpH8VUe62HhVRFJkMtnypvBPF39ekcNbVSpngHgvp0kFe0990o9Ppgm3nsWVqP-WZOw_SngrCCx5Hi5whsjZrUbgZ6d8nE1vFceVmmOi5NaqDPnP3do0vRUsPWaMvYqsvIc0yf5X9W04IqVj8OkUDvnx38FxxndP12bjahZqxonMubSS5dXYFTquj8fgEmKIVsbUeUSBJJsW5GYCSXYg_VefRe9Eb4ZGg"
+
+    # CHANGE THIS TO YOUR DESIRED DOWNLOAD DIRECTORY:
+    downloads_dir = fr"W:\Sat_Project\DOWNLOADS_{num}"
+
+    # Make sure download folder exists:
+    os.makedirs(downloads_dir, exist_ok=True)
+
+    # Run ONLY the download:
+    print("✅ Starting VIIRS-only download...")
+    sync(source, downloads_dir, token)
+    print("✅ VIIRS-only download complete.")
+
+    # Step 2: Sort downloaded files into timestamp folders
+    print("✅ Starting sorting into timestamp folders...")
+    for file in os.listdir(downloads_dir):
+        file_path = os.path.join(downloads_dir, file)
+
+        # Skip directories (already sorted)
+        if not os.path.isfile(file_path):
+            continue
+
+        # Extract datetime from filename (format "YYYY-MM-DD_HH-MM")
+        extracted_datetime = extract_datetime_from_filename(file)
+        if not extracted_datetime:
+            print(f"⚠ Could not extract date from '{file}', skipping.")
+            continue
+
+        # Create folder based on timestamp
+        order_folder = extracted_datetime.strftime('%Y-%m-%d_%H-%M')
+        order_path = os.path.join(downloads_dir, order_folder)
+        os.makedirs(order_path, exist_ok=True)
+
+        # Move the file into the folder
+        shutil.move(file_path, os.path.join(order_path, file))
+        print(f"✅ Moved '{file}' to folder '{order_folder}'.")
+
+    print("✅ Sorting complete. All files are organized by date and time.")
+
+
+
+
