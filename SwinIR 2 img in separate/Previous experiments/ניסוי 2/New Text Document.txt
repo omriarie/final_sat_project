@@ -1,0 +1,3 @@
+# embed_dim=64,
+    # num_heads=[8,8,8,8,8,8],
+upsampler='nearest+conv',
